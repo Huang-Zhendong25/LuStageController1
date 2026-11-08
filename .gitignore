@@ -24,3 +24,6 @@
 # Keil/J-Link debug traces
 JLinkLog.txt
 JLinkSettings.ini
+
+.vscode/
+

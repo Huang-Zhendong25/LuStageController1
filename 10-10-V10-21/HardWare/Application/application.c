@@ -38,6 +38,8 @@
 /*任务栈大小，单位字节*/
 #define  APP_CFG_TASK_NETXPRO_STK_SIZE                  4096u
 #define  APP_CFG_TASK_DEFAULT_STK_SIZE                   256u
+#define  APP_CFG_TASK_TEMPRESP_STK_SIZE                 2048u
+#define  APP_CFG_TASK_TEMPRESP_PRIO                      20u
 
 /*静态全局变量*/                                                        
 TX_THREAD   				AppTaskNetXProTCB;
@@ -45,10 +47,14 @@ static  uint64_t    AppTaskNetXProStk[APP_CFG_TASK_NETXPRO_STK_SIZE/8];
 
 TX_THREAD   				AppTaskDefaultTCB;
 static  uint64_t    AppTaskDefaultStk[APP_CFG_TASK_DEFAULT_STK_SIZE/8];
+TX_THREAD   				AppTaskTempRespTCB;
+static  uint64_t         AppTaskTempRespStk[APP_CFG_TASK_TEMPRESP_STK_SIZE/8];
+TX_SEMAPHORE             TempRespSemaphore;
 
 /*函数声明*/
 static  void  		AppTaskNetXPro(ULONG thread_input);
 static  void  		AppTaskDefault(ULONG thread_input);
+static  void  		AppTaskTempResp(ULONG thread_input);
 
 /*
 *********************************************************************************************************
@@ -83,6 +89,18 @@ void  tx_application_define(void *first_unused_memory)
                       APP_CFG_TASK_NetXPro_PRIO,      	/* 任务抢占阀值 		*/
                       TX_NO_TIME_SLICE,               	/* 不开启时间片 		*/
                       TX_AUTO_START);                	 	/* 创建后立即启动 	*/   
+	/**************创建温度应答转发任务*********************/
+	tx_semaphore_create(&TempRespSemaphore, "Temp Resp Sem", 0);
+	tx_thread_create(&AppTaskTempRespTCB,             /* 任务控制块地址 	*/
+					 "App Temp Resp",                  /* 任务名 				*/
+					 AppTaskTempResp,                  /* 启动任务函数地址 */
+					 0,                                /* 传递给任务的参数 */
+					 &AppTaskTempRespStk[0],           /* 堆栈基地址 			*/
+					 APP_CFG_TASK_TEMPRESP_STK_SIZE,   /* 堆栈空间大小 		*/
+					 APP_CFG_TASK_TEMPRESP_PRIO,       /* 任务优先级			*/
+					 APP_CFG_TASK_TEMPRESP_PRIO,       /* 任务抢占阀值 		*/
+					 TX_NO_TIME_SLICE,                 /* 不开启时间片 		*/
+					 TX_AUTO_START);                   /* 创建后立即启动 	*/
 }
 /*
 *********************************************************************************************************
@@ -194,6 +212,18 @@ extern VOID  		nx_driver_stm32f4xx(NX_IP_DRIVER *driver_req_ptr);
 #define UART_Handle   huart1                    /* 调用串口 */
 #define UART_TxBuffSzie         256          	/* 发送缓冲区大小 */
 uint8_t UART_TxBuff[UART_TxBuffSzie];        	/* 发送缓冲区 */
+#define UART_RxBuffSize          10                          /* 每路UART接收缓冲区大小(固定应答10字节) */
+static uint8_t UART1_RxBuff[UART_RxBuffSize];
+static uint8_t UART2_RxBuff[UART_RxBuffSize];
+static uint8_t UART3_RxBuff[UART_RxBuffSize];
+static uint8_t UART4_RxBuff[UART_RxBuffSize];
+static uint8_t UART5_RxBuff[UART_RxBuffSize];
+static uint8_t UART6_RxBuff[UART_RxBuffSize];
+static uint8_t UART7_RxBuff[UART_RxBuffSize];
+static uint8_t UART8_RxBuff[UART_RxBuffSize];
+static uint8_t TempRespFrame[10];                            /* 温度应答帧 */
+volatile uint8_t  TempQueryPending = 0;                      /* 温度查询进行中标志 */
+volatile uint16_t TempQueryID = 0;                           /* 当前查询的光源ID */
 
 Frame_Param_TypeDef 		Frame_Param_Struct;
 Memory_Param_TypeDef 		Memory_Param_Struct;
@@ -202,6 +232,7 @@ Bootloader_Address_Typedef 	Bootloader_Address_Struct;
 /**********************************************函数声明*************************************/											   
 static void Frame_Data_Handler(void);
 static void Frame_UDP_Data_Send(uint16_t Cmd ,uint8_t *pData,uint16_t Size);
+static void Frame_UDP_Data_Send_Raw(uint8_t *pData,uint16_t Size);
 static void System_Frequency_Start_Handler(uint8_t Camera_Frequency, uint16_t LightSource_Frequency, uint16_t LightSource_Counter,uint16_t Camera_PulseWidth, uint16_t Camera_SyncDelay); 
 static void System_Frequency_Stop_Handler(void);											   
 /*********************************************************************************************************
@@ -408,6 +439,31 @@ void Frame_UART_RX_TX_LOW(void)
 	RS485_7_Mode_Rx();  //串口7接收模式
 	RS485_8_Mode_Rx();  //串口8接收模式
 }
+
+/* 8路UART接收初始化：清空并挂起每路固定长度接收 */
+void Frame_UART_Start_Receive(void)
+{
+	Frame_UART_RX_TX_LOW();
+
+	HAL_UART_AbortReceive(&huart1);
+	HAL_UART_AbortReceive(&huart2);
+	HAL_UART_AbortReceive(&huart3);
+	HAL_UART_AbortReceive(&huart4);
+	HAL_UART_AbortReceive(&huart5);
+	HAL_UART_AbortReceive(&huart6);
+	HAL_UART_AbortReceive(&huart7);
+	HAL_UART_AbortReceive(&huart8);
+
+	HAL_UART_Receive_IT(&huart1, UART1_RxBuff, UART_RxBuffSize);
+	HAL_UART_Receive_IT(&huart2, UART2_RxBuff, UART_RxBuffSize);
+	HAL_UART_Receive_IT(&huart3, UART3_RxBuff, UART_RxBuffSize);
+	HAL_UART_Receive_IT(&huart4, UART4_RxBuff, UART_RxBuffSize);
+	HAL_UART_Receive_IT(&huart5, UART5_RxBuff, UART_RxBuffSize);
+	HAL_UART_Receive_IT(&huart6, UART6_RxBuff, UART_RxBuffSize);
+	HAL_UART_Receive_IT(&huart7, UART7_RxBuff, UART_RxBuffSize);
+	HAL_UART_Receive_IT(&huart8, UART8_RxBuff, UART_RxBuffSize);
+}
+
 /* 串口1-8的DMA数据发送函数 */
 static void Frame_UART_Data_Send(UART_HandleTypeDef *huart,uint8_t *pData,uint16_t Len)
 {
@@ -434,17 +490,117 @@ static void Frame_UART_Data_Send(UART_HandleTypeDef *huart,uint8_t *pData,uint16
 //	HAL_UART_Transmit_DMA(&huart7,UART_TxBuff,xData - UART_TxBuff);
 //	HAL_UART_Transmit_DMA(&huart8,UART_TxBuff,xData - UART_TxBuff);
 //}
-///* 串口3-接收回调函数 */
-//void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
-//{
-//	if(huart == &huart3)
-//	{
-//		if(Frame_Param_Struct.Upgrade_Device != 1)
-//		{
-//			Frame_Param_Struct.Upgrade_status = 1;
-//		}	
-//	}
-//}
+/* UART发送完成回调：等待TC后把对应RS485切回接收，保证最后一字节发完 */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+	uint32_t Timeout = 10000;
+
+	while((!__HAL_UART_GET_FLAG(huart, UART_FLAG_TC)) && (Timeout--))
+	{
+	}
+
+	if(huart == &huart1)
+	{
+		RS485_1_Mode_Rx();
+	}
+	else if(huart == &huart2)
+	{
+		RS485_2_Mode_Rx();
+	}
+	else if(huart == &huart3)
+	{
+		RS485_3_Mode_Rx();
+	}
+	else if(huart == &huart4)
+	{
+		RS485_4_Mode_Rx();
+	}
+	else if(huart == &huart5)
+	{
+		RS485_5_Mode_Rx();
+	}
+	else if(huart == &huart6)
+	{
+		RS485_6_Mode_Rx();
+	}
+	else if(huart == &huart7)
+	{
+		RS485_7_Mode_Rx();
+	}
+	else if(huart == &huart8)
+	{
+		RS485_8_Mode_Rx();
+	}
+}
+
+/* UART接收完成回调：校验温度应答帧并通知转发线程 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+	uint8_t *pRx = NULL;
+
+	if(huart == &huart1)      pRx = UART1_RxBuff;
+	else if(huart == &huart2) pRx = UART2_RxBuff;
+	else if(huart == &huart3) pRx = UART3_RxBuff;
+	else if(huart == &huart4) pRx = UART4_RxBuff;
+	else if(huart == &huart5) pRx = UART5_RxBuff;
+	else if(huart == &huart6) pRx = UART6_RxBuff;
+	else if(huart == &huart7) pRx = UART7_RxBuff;
+	else if(huart == &huart8) pRx = UART8_RxBuff;
+
+	if(pRx != NULL)
+	{
+		if(TempQueryPending != 0)
+		{
+			uint8_t sum = 0;
+			uint16_t rx_id;
+			uint8_t i;
+
+			for(i = 4 ; i < 9 ; i++)
+			{
+				sum += pRx[i];
+			}
+			rx_id = (uint16_t)((pRx[7] << 8) | pRx[6]);
+
+			if((pRx[0] == 0x4C) && (pRx[1] == 0x55) &&
+			   (pRx[2] == 0x05) && (pRx[3] == 0x00) &&
+			   (pRx[4] == 0x03) && (pRx[5] == 0x55) &&
+			   (pRx[9] == sum) &&
+			   (rx_id == TempQueryID))
+			{
+				for(i = 0 ; i < 10 ; i++)
+				{
+					TempRespFrame[i] = pRx[i];
+				}
+				tx_semaphore_put(&TempRespSemaphore);
+			}
+		}
+
+		/* 重新挂起本路接收 */
+		HAL_UART_Receive_IT(huart, pRx, UART_RxBuffSize);
+	}
+}
+
+/* UART错误回调：清错误并重新挂起本路接收 */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+	uint8_t *pRx = NULL;
+
+	if(huart == &huart1)      pRx = UART1_RxBuff;
+	else if(huart == &huart2) pRx = UART2_RxBuff;
+	else if(huart == &huart3) pRx = UART3_RxBuff;
+	else if(huart == &huart4) pRx = UART4_RxBuff;
+	else if(huart == &huart5) pRx = UART5_RxBuff;
+	else if(huart == &huart6) pRx = UART6_RxBuff;
+	else if(huart == &huart7) pRx = UART7_RxBuff;
+	else if(huart == &huart8) pRx = UART8_RxBuff;
+
+	if(pRx != NULL)
+	{
+		HAL_UART_AbortReceive(huart);
+		HAL_UART_Receive_IT(huart, pRx, UART_RxBuffSize);
+	}
+}
+
 /*接收帧buffer*/
 uint8_t  Frame_DataBuff_Tx[512];
 uint32_t count = 0;
@@ -1007,6 +1163,27 @@ static void Frame_Data_Handler(void)
 			Frame_UART_RX_TX_LOW();
 		}
 		break;
+		case Frame_INFO_CMD_LightSource_Temperature:        /*查询指定光源灯板温度*/
+		{
+			if(TempQueryPending == 0)
+			{
+				TempQueryID = (Frame_Param_Struct.Data[1] << 8) | Frame_Param_Struct.Data[0];
+				TempQueryPending = 1;
+
+				Frame_UART_RX_TX();
+				Frame_UART_Data_Send(&huart1,(uint8_t *)&Frame_Param_Struct,Frame_Param_Struct.FrameSize);	/* 串口1发送 */
+				Frame_UART_Data_Send(&huart2,(uint8_t *)&Frame_Param_Struct,Frame_Param_Struct.FrameSize);	/* 串口2发送 */
+				Frame_UART_Data_Send(&huart3,(uint8_t *)&Frame_Param_Struct,Frame_Param_Struct.FrameSize);	/* 串口3发送 */
+				Frame_UART_Data_Send(&huart4,(uint8_t *)&Frame_Param_Struct,Frame_Param_Struct.FrameSize);	/* 串口4发送 */
+				Frame_UART_Data_Send(&huart5,(uint8_t *)&Frame_Param_Struct,Frame_Param_Struct.FrameSize);	/* 串口5发送 */
+				Frame_UART_Data_Send(&huart6,(uint8_t *)&Frame_Param_Struct,Frame_Param_Struct.FrameSize);	/* 串口6发送 */
+				Frame_UART_Data_Send(&huart7,(uint8_t *)&Frame_Param_Struct,Frame_Param_Struct.FrameSize);	/* 串口7发送 */
+				Frame_UART_Data_Send(&huart8,(uint8_t *)&Frame_Param_Struct,Frame_Param_Struct.FrameSize);	/* 串口8发送 */
+				/* 各路DE回接收由 HAL_UART_TxCpltCallback 在发送完成后逐路完成 */
+			}
+		}
+		break;
+
 		default :	break;
 	}
 }
@@ -1056,6 +1233,48 @@ static void Frame_UDP_Data_Send(uint16_t Cmd ,uint8_t *pData,uint16_t Size)
 	}
 	/* 发送数据包到UDP发送端 */
 	ret =  nx_udp_socket_send(&UDPSocket, TraPacket, source_ip_address, source_port);
+}
+
+static void Frame_UDP_Data_Send_Raw(uint8_t *pData,uint16_t Size)
+{
+	UINT ret;
+	NX_PACKET *TxPacket;
+
+	ret = nx_packet_allocate(&pool_0, &TxPacket, NX_UDP_PACKET, TX_WAIT_FOREVER);
+	if (ret)
+	{
+		return;
+	}
+
+	ret = nx_packet_data_append(TxPacket, (VOID *)pData, Size, &pool_0, TX_WAIT_FOREVER);
+	if (ret)
+	{
+		nx_packet_release(TxPacket);
+		return;
+	}
+
+	nx_udp_socket_send(&UDPSocket, TxPacket, source_ip_address, source_port);
+}
+
+/* 温度应答转发线程：在任务上下文中发送UDP，避免在中断中调用NetX */
+static void AppTaskTempResp(ULONG thread_input)
+{
+	(void)thread_input;
+
+	while(1)
+	{
+		if(tx_semaphore_get(&TempRespSemaphore, 50) == TX_SUCCESS)
+		{
+			TempQueryPending = 0;
+			Frame_UDP_Data_Send_Raw(TempRespFrame, 10);
+		}
+		else
+		{
+			/* 超时未收到应答：清除标志并重新挂起各路接收 */
+			TempQueryPending = 0;
+			Frame_UART_Start_Receive();
+		}
+	}
 }
 
 static void System_Frequency_Start_Handler(uint8_t Camera_Frequency, uint16_t LightSource_Frequency, uint16_t LightSource_Counter,uint16_t Camera_PulseWidth, uint16_t Camera_SyncDelay)

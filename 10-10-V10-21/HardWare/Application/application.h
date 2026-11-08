@@ -122,6 +122,7 @@ typedef struct
 
 #define Frame_CFG_CMD_DebugTest                        0x0001
 #define	Frame_CFG_CMD_Heavy_Test 					   0x0002		//重光照测试模式下光源参数配置
+#define Frame_INFO_CMD_LightSource_Temperature        0x5503        //查询指定光源灯板温度
 
 
 
@@ -154,6 +155,8 @@ typedef struct
 #pragma pack()
 
 void Frame_UART_RX_TX(void);
+void Frame_UART_RX_TX_LOW(void);
+void Frame_UART_Start_Receive(void);
 
 #endif
 

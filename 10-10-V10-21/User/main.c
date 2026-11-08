@@ -4,6 +4,7 @@
 #include "gpio.h"
 #include "dma.h"
 #include "bsp_flash.h"
+#include "application.h"
 /*
 *********************************************************************************************************
 *	函 数 名: main
@@ -30,6 +31,7 @@ int main(void)
 	MX_USART2_UART_Init();
 	MX_USART3_UART_Init();
 	MX_USART6_UART_Init();	
+	Frame_UART_Start_Receive();
     /* 进入ThreadX内核 */
     tx_kernel_enter();
 
