@@ -4,7 +4,7 @@
 
 - 通过网口（UDP）接收上位机下发的 LUSTER 协议数据帧；
 - 解析后通过 8 路 RS485 广播给光源；
-- 本仓库在原始工程基础上实现了命令字 `0x0355`（查询指定光源灯板温度）的“下发 -> 接收 -> 回传”功能。
+- 本仓库在原始工程基础上实现了命令字 `0x0355`（查询指定光源灯板温度）的“下发 → 接收 → 回传”功能，并修复了原始工程中的若干问题。
 
 ## 1. 系统通信架构
 
@@ -34,23 +34,90 @@
 4C 55 05 00 03 55 ID_L ID_H TEMP CS   // 10 字节
 ```
 
-## 3. 本功能在控制板侧的改动
+## 3. 相对原始代码的改进及原因
 
-### 修改文件
+### 3.1 新增 0x0355 温度查询转发功能
 
-- `10-10-V10-21/HardWare/Application/application.h`
-- `10-10-V10-21/HardWare/Application/application.c`
-- `10-10-V10-21/User/main.c`
+原始控制器只有“UDP 收包 → 8 路 RS485 广播下发”，**没有任何 UART 接收能力**，因此无法把光源的应答回传给上位机。
 
-### 3.1 命令字定义（application.h）
+本实现新增：
+
+- 8 路 UART 固定 10 字节接收（`Frame_UART_Start_Receive()` + `HAL_UART_Receive_IT`）；
+- 应答帧完整校验（`HAL_UART_RxCpltCallback`）；
+- 独立转发线程 + 信号量（`AppTaskTempResp` + `TempRespSemaphore`），把光源的 10 字节应答**原样**通过 UDP 回传。
+
+原因：协议要求“控制器接收光源返回命令后，转发光源返回命令”，因此控制器必须能收 RS485 数据并原样转 UDP。
+
+### 3.2 修复原始代码 `LightSource_Counter > 1` → `>= 1`
+
+`System_Frequency_Start_Handler()` 中：
 
 ```c
-#define Frame_INFO_CMD_LightSource_Temperature        0x5503   // 查询指定光源灯板温度
+// 原始（错误）
+if((Frame_Param_Struct.LightSource_Counter > 1) && (Frame_Param_Struct.LightSource_Frequency > 0))
+// 修正后
+if((Frame_Param_Struct.LightSource_Counter >= 1) && (Frame_Param_Struct.LightSource_Frequency > 0))
 ```
 
-说明：控制板 `Frame_Param_Struct.CMD_Union.buff` 是“命令字在内存里的小端值”，线序 `03 55` 对应内部值 `0x5503`，与其它 `Frame_CFG_CMD_*` 的写法一致。
+原因：`LightSource_Counter == 1` 时原始代码无法进入频闪/触发启动逻辑（边界值判断错误）；与“确认无误版”（Light_Controller/10-10-V10-21）对照后确认应为 `>= 1`。
 
-### 3.2 UDP 查询处理分支（application.c, Frame_Data_Handler）
+### 3.3 485 方向时序分离（本次排障的关键点之一）
+
+温度查询需要“发完立即收应答”；固件升级及其它广播是单向下发，DE 时序应保持原始的 `Frame_UART_RX_TX() → tx_thread_sleep → Frame_UART_RX_TX_LOW()`。
+
+最终方案：`HAL_UART_TxCpltCallback` 只在 `TempQueryPending` 为真时才逐路切回收：
+
+```c
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if(TempQueryPending)   // 仅温度查询才逐路切回
+    {
+        if(huart == &huart1)      RS485_1_Mode_Rx();
+        else if(huart == &huart2) RS485_2_Mode_Rx();
+        // ... 每路对应
+    }
+}
+```
+
+原因：初版在回调里**无条件**切回 DE，导致固件升级转发时 DE 被提前拉低、509 字节数据帧被截断，光源升级后卡死。加上 `TempQueryPending` 门控后，固件升级等其它广播完全回到原始时序。
+
+### 3.4 转发线程超时分支不再动 DE / 串口（修复升级卡死的根本原因）
+
+初版转发线程超时时会调用 `Frame_UART_Start_Receive()`，而它内部有 `Frame_UART_RX_TX_LOW()`，会把 8 路 DE 全部拉低。该线程每 50 tick 超时一次，**即使没有任何温度查询，也会在后台周期性地把 DE 拉低**，在固件升级发送过程中截断数据帧。
+
+最终改为超时只清标志：
+
+```c
+else
+{
+    /* 超时未收到应答：仅清除标志；不重装接收、不动DE */
+    TempQueryPending = 0;
+}
+```
+
+原因：后台周期任务/中断绝对不能动 485 方向，否则会破坏正在进行的任何广播/升级。
+
+### 3.5 ISR 安全
+
+接收中断 `HAL_UART_RxCpltCallback` 里只做：校验、拷贝 10 字节、`tx_semaphore_put()`；NetX 的 `nx_udp_socket_send` 全部放在 `AppTaskTempResp` 线程里。
+
+原因：NetX/ThreadX 的阻塞 API 不允许在中断上下文调用。
+
+### 3.6 去掉中断里的等待循环
+
+旧版 HAL 的 `HAL_UART_TxCpltCallback` 是在 UART **TC 中断**里被调用的，此时 TC 已置位，所以 `while(!TC)` 等待是多余的；且中断里长时间等待是坏习惯，已删除。
+
+## 4. 实现细节（最终代码）
+
+### 4.1 命令字定义（application.h）
+
+```c
+#define Frame_INFO_CMD_LightSource_Temperature        0x5503
+```
+
+控制板 `Frame_Param_Struct.CMD_Union.buff` 是“命令字在内存里的小端值”，线序 `03 55` 对应内部值 `0x5503`，与其它 `Frame_CFG_CMD_*` 写法一致。
+
+### 4.2 温度查询处理分支（Frame_Data_Handler）
 
 ```c
 case Frame_INFO_CMD_LightSource_Temperature:
@@ -71,10 +138,10 @@ break;
 
 要点：
 
-- 上位机一次只查一个灯，`TempQueryPending` 作为“单飞”保护：上一笔未完成时忽略新查询。
+- `TempQueryPending` 作为“单飞”保护：上一笔未完成时忽略新查询。
 - 查询帧在 NetXPro 线程内直接使用 `Frame_Param_Struct`（该结构此时有效），避免跨线程访问被下一帧覆盖。
 
-### 3.3 8 路 UART 接收初始化
+### 4.3 8 路 UART 接收初始化
 
 ```c
 #define UART_RxBuffSize 10
@@ -92,23 +159,11 @@ void Frame_UART_Start_Receive(void)
 }
 ```
 
-> 注：本工程 HAL 为旧版，无 `HAL_UARTEx_ReceiveToIdle_IT`，故采用固定 10 字节 `HAL_UART_Receive_IT`；光源应答固定 10 字节，配合超时重装保证可靠。
+该函数**只在 `main.c` 上电初始化时调用一次**（转发线程超时分支不再调用，避免动 DE）。
 
-### 3.4 发送完成后 DE 回接收（逐路，等 TC）
+> 注：本工程 HAL 为旧版，无 `HAL_UARTEx_ReceiveToIdle_IT`，故采用固定 10 字节 `HAL_UART_Receive_IT`；光源应答固定 10 字节。
 
-```c
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
-{
-    uint32_t Timeout = 10000;
-    while((!__HAL_UART_GET_FLAG(huart, UART_FLAG_TC)) && (Timeout--)) {}
-
-    if(huart == &huart1)      RS485_1_Mode_Rx();
-    else if(huart == &huart2) RS485_2_Mode_Rx();
-    // ... 每路对应
-}
-```
-
-### 3.5 接收校验与通知（不在中断里发 UDP）
+### 4.4 接收校验与通知（不在中断里发 UDP）
 
 ```c
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
@@ -128,7 +183,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 }
 ```
 
-### 3.6 错误恢复
+### 4.5 错误恢复
 
 ```c
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
@@ -138,7 +193,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 }
 ```
 
-### 3.7 温度应答转发线程（在任务上下文里发 UDP）
+### 4.6 温度应答转发线程（在任务上下文里发 UDP）
 
 ```c
 TX_SEMAPHORE TempRespSemaphore;   // 全局
@@ -156,8 +211,7 @@ static void AppTaskTempResp(ULONG thread_input)
         }
         else
         {
-            TempQueryPending = 0;       // 超时清除
-            Frame_UART_Start_Receive(); // 重装8路接收
+            TempQueryPending = 0;   // 超时只清标志，不动 DE / 不重装接收
         }
     }
 }
@@ -170,7 +224,7 @@ tx_semaphore_create(&TempRespSemaphore, "Temp Resp Sem", 0);
 tx_thread_create(&AppTaskTempRespTCB, "App Temp Resp", AppTaskTempResp, ...);
 ```
 
-### 3.8 原样 UDP 回传
+### 4.7 原样 UDP 回传
 
 ```c
 static void Frame_UDP_Data_Send_Raw(uint8_t *pData, uint16_t Size)
@@ -181,7 +235,7 @@ static void Frame_UDP_Data_Send_Raw(uint8_t *pData, uint16_t Size)
 }
 ```
 
-### 3.9 main.c 初始化
+### 4.8 main.c 初始化
 
 ```c
 #include "application.h"
@@ -191,12 +245,23 @@ Frame_UART_Start_Receive();   // 挂起8路接收
 tx_kernel_enter();
 ```
 
-## 4. 编译与烧录
+## 5. 修改过程注意事项（经验教训）
+
+1. **后台周期任务 / 中断不要动 485 方向**：任何无条件或周期性的 DE 切换，都会在广播 / 固件升级发送过程中截断数据帧。这是本次“升级后光源卡死”的根本原因。
+2. **发送完成回调要区分场景**：温度查询（要立即收应答）与固件升级（单向广播）共用 8 路 UART，必须用标志（`TempQueryPending`）区分，不能无条件切 DE。
+3. **中断里不要 busy-wait**：尤其不要 `while(!TC)`；旧版 HAL 的 TxCpltCallback 已在 TC 中断内（TC 已置位），直接切 DE 即可。
+4. **不在 ISR 里调 NetX/ThreadX**：接收中断用 `tx_semaphore_put` 通知，UDP 发送放到独立线程。
+5. **回传要“原样转发”**：直接转发光源的 10 字节应答，不要重新拆 / 组包，避免命令字、字节序出错。
+6. **“升级成功”提示不可靠**：光源固件升级的 `data` 命令算出了 flash 写结果但不上报，控制器无条件回 `0x01`；排查升级问题应回读 flash 与 bin 对比。
+7. **命令字字节序两侧不一致**：控制板内部 `0x0355` 对应 `0x5503`（字节交换后的值），光源侧直接是 `0x0355`，不要写反。
+8. **旧版 HAL 没有 `HAL_UARTEx_ReceiveToIdle_IT`**：接收用固定 10 字节 `HAL_UART_Receive_IT` + 超时恢复。
+
+## 6. 编译与烧录
 
 - Keil MDK 打开 `10-10-V10-21/Project/MDK-ARM(AC5)/project.uvprojx` 编译。
 - 通过 SWD/ST-Link 烧录到控制板。
 
-## 5. 联调测试（完整链路）
+## 7. 联调测试（完整链路）
 
 1. 分别烧录光源、控制板新固件。
 2. PC 网口 IP 设为 `192.168.0.100`。
@@ -217,15 +282,7 @@ tx_kernel_enter();
 
 例如 30℃：`4C 55 05 00 03 55 01 00 1E 77`。
 
-## 6. 关键设计说明
-
-- **ISR 安全**：UART 接收中断里只做校验、拷贝、`tx_semaphore_put`；NetX 的 `nx_udp_socket_send` 一律在 `AppTaskTempResp` 线程中调用，避免在中断里调用 NetX。
-- **485 方向**：DE 等 TC 后再拉低，保证最后一个字节发完；逐路独立拉低，查询后能最快切回收等待应答。
-- **正确接收**：固定 10 字节接收 + 完整校验（帧头/长度/命令/校验和/ID），并只在“查询进行中”时接受，防止串扰。
-- **超时恢复**：50 tick 无应答则清除标志并重装 8 路接收，保证下一笔查询可用。
-- **单飞保护**：`TempQueryPending` 保证同一时刻只处理一笔温度查询，与“上位机一次只查一个光源”一致。
-
-## 7. 注意事项
+## 8. 注意事项
 
 - 回传 UDP 目标沿用工程现有约定 `192.168.0.100:8888`。
 - 若某串口连接的灯未按 ID 匹配，不会应答；控制器 50 tick 超时后自动恢复。

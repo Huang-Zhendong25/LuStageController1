@@ -493,43 +493,42 @@ static void Frame_UART_Data_Send(UART_HandleTypeDef *huart,uint8_t *pData,uint16
 /* UART发送完成回调：等待TC后把对应RS485切回接收，保证最后一字节发完 */
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
-	uint32_t Timeout = 10000;
-
-	while((!__HAL_UART_GET_FLAG(huart, UART_FLAG_TC)) && (Timeout--))
+	/* 只有温度查询(需要立即收应答)时才逐路切回接收；
+	   固件升级等其它广播由原来的 Frame_UART_RX_TX_LOW() 统一切回，避免影响升级时序 */
+	if(TempQueryPending)
 	{
-	}
-
-	if(huart == &huart1)
-	{
-		RS485_1_Mode_Rx();
-	}
-	else if(huart == &huart2)
-	{
-		RS485_2_Mode_Rx();
-	}
-	else if(huart == &huart3)
-	{
-		RS485_3_Mode_Rx();
-	}
-	else if(huart == &huart4)
-	{
-		RS485_4_Mode_Rx();
-	}
-	else if(huart == &huart5)
-	{
-		RS485_5_Mode_Rx();
-	}
-	else if(huart == &huart6)
-	{
-		RS485_6_Mode_Rx();
-	}
-	else if(huart == &huart7)
-	{
-		RS485_7_Mode_Rx();
-	}
-	else if(huart == &huart8)
-	{
-		RS485_8_Mode_Rx();
+		if(huart == &huart1)
+		{
+			RS485_1_Mode_Rx();
+		}
+		else if(huart == &huart2)
+		{
+			RS485_2_Mode_Rx();
+		}
+		else if(huart == &huart3)
+		{
+			RS485_3_Mode_Rx();
+		}
+		else if(huart == &huart4)
+		{
+			RS485_4_Mode_Rx();
+		}
+		else if(huart == &huart5)
+		{
+			RS485_5_Mode_Rx();
+		}
+		else if(huart == &huart6)
+		{
+			RS485_6_Mode_Rx();
+		}
+		else if(huart == &huart7)
+		{
+			RS485_7_Mode_Rx();
+		}
+		else if(huart == &huart8)
+		{
+			RS485_8_Mode_Rx();
+		}
 	}
 }
 
@@ -1270,9 +1269,8 @@ static void AppTaskTempResp(ULONG thread_input)
 		}
 		else
 		{
-			/* 超时未收到应答：清除标志并重新挂起各路接收 */
+			/* 超时未收到应答：仅清除标志；不重装接收、不动DE，避免影响固件升级等广播时序 */
 			TempQueryPending = 0;
-			Frame_UART_Start_Receive();
 		}
 	}
 }
@@ -1287,7 +1285,7 @@ static void System_Frequency_Start_Handler(uint8_t Camera_Frequency, uint16_t Li
 //	if(Frame_Param_Struct.System_Mode == System_Mode_MaterialMode || ((Frame_Param_Struct.System_Mode == System_Mode_OLATMode)) \
 //	   || Frame_Param_Struct.System_Mode == System_Mode_Relighting_Mode)//材质结算 重光照、OLAT模式
 //	{
-		if((Frame_Param_Struct.LightSource_Counter > 1) && (Frame_Param_Struct.LightSource_Frequency >0))
+		if((Frame_Param_Struct.LightSource_Counter >= 1) && (Frame_Param_Struct.LightSource_Frequency >0))
 		{	
 			//使用中断计数模式
 			LL_TIM_SetCounter(Count_TIMx,0);											// count_TIMx = TIM4 --- 从0开始计数
